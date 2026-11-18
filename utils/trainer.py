@@ -1,0 +1,174 @@
+import torch
+import torch.nn.functional as F
+from tqdm import tqdm
+
+from models import channel_label
+from utils import metrics
+
+
+def _crop_pair(sr_img, hr_img, scale):
+    border = int(scale)
+    if border <= 0:
+        return sr_img, hr_img
+    return (
+        sr_img[:, :, border:-border, border:-border],
+        hr_img[:, :, border:-border, border:-border],
+    )
+
+
+def _finalize_metrics(metrics_list, clip_ratio):
+    if clip_ratio < 1.0:
+        metrics_list.sort(key=lambda item: item[0], reverse=True)
+        metrics_list = metrics_list[: max(1, int(len(metrics_list) * clip_ratio))]
+    return {
+        "psnr": sum(item[0] for item in metrics_list) / len(metrics_list),
+        "ssim": sum(item[1] for item in metrics_list) / len(metrics_list),
+    }
+
+
+def _forward_model(model, model_input, channels=None, is_residual=None):
+    # Compatibility for callers that still pass the old skip-control argument.
+    base_model = getattr(model, "_orig_mod", model)
+    if is_residual is not None and hasattr(base_model, "use_bilinear"):
+        return model(model_input, channels=channels, use_bilinear=is_residual)
+    return model(model_input, channels=channels)
+
+
+def _evaluate_metrics_loop(val_loader, device, sr_builder, scale, clip_ratio, desc):
+    metrics_list = []
+    with torch.no_grad():
+        for lr_img, hr_img in tqdm(val_loader, desc=desc, leave=False):
+            lr_img, hr_img = lr_img.to(device, non_blocking=True).float(), hr_img.to(device, non_blocking=True).float()
+            sr_img, hr_img = _crop_pair(
+                sr_builder(lr_img).round().clamp(0, 255), hr_img, scale
+            )
+            metrics_list.append(
+                (
+                    metrics.calculate_psnr(sr_img.squeeze(0), hr_img.squeeze(0)),
+                    metrics.calculate_ssim(sr_img.squeeze(0), hr_img.squeeze(0)),
+                )
+            )
+    return _finalize_metrics(metrics_list, clip_ratio)
+
+
+def train_epoch(
+    model,
+    train_loader,
+    loss_func,
+    optimizer,
+    device,
+    epoch,
+    ema=None,
+    is_residual=None,
+    joint_width_training=False,
+    subnet_channels=16,
+    subnet_loss_weight=1.0,
+    distill_loss_weight=0.0,
+):
+    """Train the full path and optionally the subnet path in every batch."""
+    model.train()
+    running_loss = 0.0
+    base_model = getattr(model, "_orig_mod", model)
+    for lr_img, hr_img in tqdm(train_loader, desc=f"Epoch {epoch + 1}", leave=False):
+        lr_img, hr_img = lr_img.to(device, non_blocking=True).float(), hr_img.to(device, non_blocking=True).float()
+        optimizer.zero_grad(set_to_none=True)
+        target = hr_img / 255.0
+        model_input = lr_img / 255.0
+        full_sr = _forward_model(model, model_input, channels=model.fea_dim, is_residual=is_residual)
+        full_loss = loss_func(full_sr, target)
+        loss = full_loss
+        if joint_width_training:
+            subnet_sr = _forward_model(model, model_input, channels=subnet_channels, is_residual=is_residual)
+            subnet_loss = loss_func(subnet_sr, target)
+            loss = (full_loss + subnet_loss_weight * subnet_loss) / (
+                1.0 + subnet_loss_weight
+            )
+            if distill_loss_weight > 0.0:
+                loss += distill_loss_weight * F.l1_loss(subnet_sr, full_sr.detach())
+        loss.backward()
+        optimizer.step()
+        if hasattr(base_model, "project_quantization_parameters"):
+            base_model.project_quantization_parameters()
+        if ema is not None:
+            ema.update()
+        running_loss += loss.item()
+    return running_loss / len(train_loader)
+
+
+def validate_epoch(
+    model, val_loader, loss_func, device, is_residual=None, channels=None
+):
+    model.eval()
+    channels = model.fea_dim if channels is None else channels
+    val_loss = 0.0
+    with torch.no_grad():
+        for lr_img, hr_img in tqdm(
+            val_loader, desc=f"loss-validating[{channel_label(channels)}]", leave=False
+        ):
+            lr_img, hr_img = lr_img.to(device, non_blocking=True).float(), hr_img.to(device, non_blocking=True).float()
+            target = hr_img / 255.0
+            val_loss += loss_func(
+                _forward_model(model, lr_img / 255.0, channels, is_residual), target
+            ).item()
+    return val_loss / len(val_loader)
+
+
+def validate_loss_and_metrics(
+    model, val_loader, loss_func, device, is_residual=None, channels=None
+):
+    """Compute the existing loss and image metrics using one forward per image.
+
+    Validation loaders use batch size 1, as required by the image metrics.
+    Image targets, rounding, clipping and border crops match the separate
+    validate_epoch/validate_metrics paths.
+    """
+    model.eval()
+    channels = model.fea_dim if channels is None else channels
+    val_loss = torch.zeros((), device=device)
+    metrics_list = []
+    with torch.no_grad():
+        for lr_img, hr_img in tqdm(
+            val_loader, desc=f"validating[{channel_label(channels)}]", leave=False
+        ):
+            if lr_img.shape[0] != 1:
+                raise ValueError('combined image validation requires batch size 1')
+            lr_img = lr_img.to(device, non_blocking=True).float()
+            hr_img = hr_img.to(device, non_blocking=True).float()
+            prediction = _forward_model(model, lr_img / 255.0, channels, is_residual)
+            target = hr_img / 255.0
+            sr_img = prediction * 255.0
+            val_loss += loss_func(prediction, target).detach()
+            sr_img, cropped_hr = _crop_pair(
+                sr_img.round().clamp(0, 255), hr_img, model.scale
+            )
+            metrics_list.append((
+                metrics.calculate_psnr(sr_img.squeeze(0), cropped_hr.squeeze(0)),
+                metrics.calculate_ssim(sr_img.squeeze(0), cropped_hr.squeeze(0)),
+            ))
+    return (val_loss / len(val_loader)).item(), _finalize_metrics(metrics_list, 1.0)
+
+
+def validate_metrics(
+    model, val_loader, scale, device, clip_ratio=1.0, is_residual=None, channels=None
+):
+    channels = model.fea_dim if channels is None else channels
+    model.eval()
+    sr_builder = lambda lr_img: _forward_model(
+        model, lr_img / 255.0, channels, is_residual
+    ) * 255.0
+    return _evaluate_metrics_loop(
+        val_loader, device, sr_builder, scale, clip_ratio, "metric-validating"
+    )
+
+
+def bilinear_metrics(val_loader, scale, device):
+    return _evaluate_metrics_loop(
+        val_loader,
+        device,
+        lambda lr_img: F.interpolate(
+            lr_img, scale_factor=scale, mode="bilinear", align_corners=False
+        ),
+        scale,
+        1.0,
+        "bilinear-metrics-validating",
+    )

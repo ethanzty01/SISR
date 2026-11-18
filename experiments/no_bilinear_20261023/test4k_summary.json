@@ -1,0 +1,38 @@
+[
+  {
+    "precision": "FP32",
+    "channels": 32,
+    "images": 100,
+    "psnr_db": 28.054382419586183
+  },
+  {
+    "precision": "FP32",
+    "channels": 16,
+    "images": 100,
+    "psnr_db": 26.84410774230957
+  },
+  {
+    "precision": "W8A8",
+    "channels": 32,
+    "images": 100,
+    "psnr_db": 28.03465051651001
+  },
+  {
+    "precision": "W8A8",
+    "channels": 16,
+    "images": 100,
+    "psnr_db": 27.72048215866089
+  },
+  {
+    "precision": "W4A4",
+    "channels": 32,
+    "images": 100,
+    "psnr_db": 27.010178012847902
+  },
+  {
+    "precision": "W4A4",
+    "channels": 16,
+    "images": 100,
+    "psnr_db": 26.39663627624512
+  }
+]

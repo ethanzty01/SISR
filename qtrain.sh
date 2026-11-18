@@ -1,0 +1,27 @@
+python qtrain.py \
+  --scale 4 \
+  --channel_nums 32 \
+  --subnet-channels 16 \
+  --joint_width_training \
+  --subnet_loss_weight 1.0 \
+  --distill_loss_weight 0.1 \
+  --num_blocks 5 \
+  --epochs 100 \
+  --batch_size 64 \
+  --compile \
+  --network-initial-lr 3e-4 \
+  --network-lr 1e-3 \
+  --network-min-lr 5e-5 \
+  --quant-initial-lr 1e-5 \
+  --quant-lr 6e-4 \
+  --quant-min-lr 4e-5 \
+  --num_workers 8 \
+  --save_dir "./checkpoints" \
+  --device "cuda" \
+  --in_channels 3 \
+  --patch_size 128 \
+  --warmup_epochs 10 \
+  --ema_decay 0.999 \
+  --wbits 4 \
+  --abits 4 \
+  --pretrained_fp "./checkpoints/DPSR_x4_1016_1506.pth"

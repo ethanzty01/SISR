@@ -1,0 +1,12 @@
+{
+  "method": "bicubic",
+  "scale": 4,
+  "dataset": "Test4k",
+  "images": 100,
+  "psnr_db": 27.257939357757568,
+  "align_corners": false,
+  "rgb_round_clamp": true,
+  "crop_border": 4,
+  "metric": "mean per-image Y PSNR",
+  "device": "cuda"
+}
